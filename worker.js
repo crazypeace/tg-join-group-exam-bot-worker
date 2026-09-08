@@ -8,6 +8,8 @@
  *      blog    固定答案 zelikk.blogspot.com
  *      rss     判分瞬间实时抓 RSS 重算答案
  *      youtube 固定答案 youtube.com/@crazypeace
+ *  - 私聊 /start 先查 getChatMember 权限: 已能发言(restricted+can_send_messages=true, 或 member/admin/creator) = 已放行, 不出题
+ *     (放行态在 Telegram 眼里仍是 restricted —— DEFAULT_PERMISSIONS 里 can_send_other_messages/can_send_polls 为 false)
  *  - 群组默认权限保持"可发言"; 新成员(ID>=2B)入群禁言 -> 私聊验证 -> 通过后恢复发言
  *  - ID < 2,000,000,000 的早期用户免验证(与 VPS 版一致)
  *  - 非群成员抢先私聊: 只回功能简介, 不进验证流程(与 VPS 版一致)
@@ -29,9 +31,9 @@ const BLOG_ANSWER = "zelikk.blogspot.com";
 const YOUTUBE_ANSWER = "youtube.com/@crazypeace";
 
 const QUESTION_TEXT = {
-  youtube: "❓ 请问：我的Youtube频道url是什么？\n\n请直接输入答案",
   blog: "❓ 请问：我的博客地址是什么？\n\n请直接输入答案",
   rss: "❓ 请问：我的博客的最新一期博文的标题是什么？\n\n请直接输入答案",
+  youtube: "❓ 请问：我的Youtube频道url是什么？\n\n请直接输入答案",
 };
 
 const INTRO_TEXT =
@@ -40,8 +42,19 @@ const INTRO_TEXT =
   "🔹 新成员需要向我发送 /start 并回答验证问题\n" +
   "🔹 验证通过后，我会自动解除禁言";
 
-// 与 VPS 版 ChatPermissions 逐字段一致
-const MUTE_PERMISSIONS = { can_send_messages: false };
+// 与 VPS 版 ChatPermissions 逐字段一致; 
+const MUTE_PERMISSIONS = {
+  can_send_messages: false,
+  // can_send_audios: false,
+  // can_send_documents: false,
+  // can_send_photos: false,
+  // can_send_videos: false,
+  // can_send_video_notes: false,
+  // can_send_voice_notes: false,
+  // can_send_polls: false,
+  // can_send_other_messages: false,
+  // can_add_web_page_previews: false,
+};
 
 const DEFAULT_PERMISSIONS = {
   can_send_messages: true,
@@ -51,9 +64,9 @@ const DEFAULT_PERMISSIONS = {
   can_send_audios: true,
   can_send_voice_notes: true,
   can_send_documents: true,
-  can_send_other_messages: false,
+  can_send_other_messages: true,
   can_add_web_page_previews: true,
-  can_send_polls: false,
+  can_send_polls: true,
 };
 
 // ---------------------------------------------------------------- 基础设施
@@ -161,7 +174,7 @@ async function handleJoin(env, newMember, chat) {
     chat_id: chat.id,
     user_id: user.id,
     permissions: MUTE_PERMISSIONS,
-    use_independent_permissions: true,
+    use_independent_chat_permissions: true,
   });
 
   const username = await botUsername(env);
@@ -180,15 +193,25 @@ async function handleJoin(env, newMember, chat) {
   log(`joined+muted user=${user.id} chat=${chat.id}`);
 }
 
-// 是否目标群成员: member/administrator/creator/restricted 都算在群内
-// (restricted = 在群里但被禁言 —— 正是"待验证新成员"的状态, 绝不能排除)
-async function isInGroup(env, chatId, userId) {
+// 读取目标群成员信息; 失败(不在群/被踢等)返回 null
+async function fetchMember(env, userId) {
   try {
-    const m = await api(env, "getChatMember", { chat_id: chatId, user_id: userId });
-    return ["member", "administrator", "creator", "restricted"].includes(m.status);
+    return await api(env, "getChatMember", { chat_id: env.CHAT_ID, user_id: userId });
   } catch {
-    return false;
+    return null;
   }
+}
+
+// 是否算在群内: member/administrator/creator/restricted
+// (restricted = 在群里但被禁言 —— 正是"待验证成员"的状态, 绝不能排除)
+function memberInGroup(m) {
+  return ["member", "administrator", "creator", "restricted"].includes(m.status);
+}
+
+// 已放行判定: 能发言 = 已验证 (服务端权限 override 就是验证结果)。
+// member/admin/creator 无权限字段(undefined); restricted 才有 can_send_messages 布尔。
+function memberCanSend(m) {
+  return m.can_send_messages !== false;
 }
 
 // 私聊 /start
@@ -200,11 +223,26 @@ async function handleStart(env, user) {
     });
     return;
   }
-  // 早期用户 / 不在群里(或仅被禁言的待验证成员) -> 按政策处理 (非成员抢先私聊: 不进入验证流程)
-  if (user.id < LEGACY_USER_ID_MAX || !(await isInGroup(env, env.CHAT_ID, user.id))) {
+  // 早期用户: 免验证, 只回简介
+  if (user.id < LEGACY_USER_ID_MAX) {
     await api(env, "sendMessage", { chat_id: user.id, text: INTRO_TEXT });
     return;
   }
+  const m = await fetchMember(env, user.id);
+  if (!m || !memberInGroup(m)) {
+    // 非成员抢先私聊: 只回简介, 不进验证流程
+    await api(env, "sendMessage", { chat_id: user.id, text: INTRO_TEXT });
+    return;
+  }
+  // 已放行判定: restricted 但 can_send_messages=true (验证通过后的状态), 或 member/admin/creator -> 不出题
+  if (memberCanSend(m)) {
+    await api(env, "sendMessage", {
+      chat_id: user.id,
+      text: "✅ 你已经通过验证，可以直接在群组中发言了。",
+    });
+    return;
+  }
+  // 待验证 (被禁言): 出题
   const type = questionType(user.id);
   await api(env, "sendMessage", { chat_id: user.id, text: QUESTION_TEXT[type] });
   log(`quiz served user=${user.id} type=${type}`);
@@ -214,7 +252,9 @@ async function handleStart(env, user) {
 async function handleAnswer(env, user, text) {
   if (!isTargetChat(env, env.CHAT_ID)) return; // 未配置: 不判分不放行
   if (user.id < LEGACY_USER_ID_MAX) return; // 免验证用户不需要这套
-  if (!(await isInGroup(env, env.CHAT_ID, user.id))) return; // 非成员: 忽略
+  const m = await fetchMember(env, user.id);
+  if (!m || !memberInGroup(m)) return; // 非成员: 忽略
+  if (memberCanSend(m)) return; // 已能发言 = 已验证, 不判分不出题
 
   const type = questionType(user.id);
   let correct;
@@ -246,7 +286,7 @@ async function handleAnswer(env, user, text) {
     chat_id: env.CHAT_ID,
     user_id: user.id,
     permissions: DEFAULT_PERMISSIONS,
-    use_independent_permissions: true,
+    use_independent_chat_permissions: true,
   });
 
   await api(env, "sendMessage", {
@@ -422,4 +462,4 @@ function log(line) {
 }
 
 // 导出纯函数仅供本地测试 (test.js); Worker 部署不受影响
-export { questionType, normalize, parseRssTitle };
+export { dispatch, questionType, normalize, parseRssTitle };
