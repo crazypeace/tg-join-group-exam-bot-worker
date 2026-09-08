@@ -4,10 +4,14 @@
  * 设计（与 VPS 版的行为映射）:
  *  - webhook 推模式替代 getUpdates 长轮询
  *  - 完全无状态: 不存 pending_users, 不存 valid 白名单(放行 = Telegram 服务端的成员权限 override)
- *  - 唯一题目: "我的博客的最新一期博文标题是什么?" — 判分瞬间实时抓 RSS 重算答案
+ *  - 题库: 按 user_id 快速哈希固定题型 (blog/rss/youtube 三选一, 与 tg-send-msg-exam-worker 同算法)
+ *      blog    固定答案 zelikk.blogspot.com
+ *      rss     判分瞬间实时抓 RSS 重算答案
+ *      youtube 固定答案 youtube.com/@crazypeace
  *  - 群组默认权限保持"可发言"; 新成员(ID>=2B)入群禁言 -> 私聊验证 -> 通过后恢复发言
  *  - ID < 2,000,000,000 的早期用户免验证(与 VPS 版一致)
  *  - 非群成员抢先私聊: 只回功能简介, 不进验证流程(与 VPS 版一致)
+ *  - 自动删消息功能: 按新方案砍掉
  *
  * 环境变量 (wrangler secret / vars):
  *  - BOT_TOKEN     : secret, 机器人 token
@@ -19,7 +23,16 @@
 const TG_API = "https://api.telegram.org/bot";
 const LEGACY_USER_ID_MAX = 2000000000; // ID 小于此值 = 早期用户, 免验证
 
-const QUESTION_TEXT = "❓ 请问：我的博客的最新一期博文的标题是什么？\n\n请直接输入答案";
+const Q_TYPES = ["blog", "rss", "youtube"];
+
+const BLOG_ANSWER = "zelikk.blogspot.com";
+const YOUTUBE_ANSWER = "youtube.com/@crazypeace";
+
+const QUESTION_TEXT = {
+  youtube: "❓ 请问：我的Youtube频道url是什么？\n\n请直接输入答案",
+  blog: "❓ 请问：我的博客地址是什么？\n\n请直接输入答案",
+  rss: "❓ 请问：我的博客的最新一期博文的标题是什么？\n\n请直接输入答案",
+};
 
 const INTRO_TEXT =
   "👋 你好！我是群组验证机器人。\n\n" +
@@ -87,15 +100,17 @@ function normalize(s) {
   return String(s).toLowerCase().replace(/\s+/g, "");
 }
 
-// 实时抓 RSS, 取第一个 <item><title>; 支持 CDATA。失败抛错。
-async function fetchLatestPostTitle(env) {
-  const url = env.RSS_URL;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "tg-join-group-exam-bot/1.0" },
-    cf: { cacheTtl: 60 }, // 60s 边缘缓存, 抗洪峰
-  });
-  if (!res.ok) throw new Error(`RSS fetch HTTP ${res.status}`);
-  const xml = await res.text();
+// 非常快的 32-bit 混合 (Knuth 黄金比例乘法 + xorshift), 仅整数运算, 无字符串/BigInt
+function questionType(userId) {
+  let x = Math.imul(userId | 0, 0x9e3779b1) >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x21f0aaad) >>> 0;
+  x = (x ^ (x >>> 15)) >>> 0; // 末尾必须再转 unsigned, 否则可能为负 -> %3 得负索引
+  return Q_TYPES[x % 3];
+}
+
+// 解析 RSS, 取第一个 <item><title>; 支持 CDATA。失败抛错。
+function parseRssTitle(xml) {
   // 定位第一个 <item>, 再取其中的 <title>
   const itemStart = xml.search(/<item[\s>]/i);
   const scope = itemStart >= 0 ? xml.slice(itemStart) : xml;
@@ -106,6 +121,24 @@ async function fetchLatestPostTitle(env) {
   if (cdata) title = cdata[1].trim();
   if (!title) throw new Error("RSS: empty title");
   return title;
+}
+
+// 实时抓 RSS, 取第一个 item 标题。失败抛错。
+async function fetchLatestPostTitle(env) {
+  const url = env.RSS_URL;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "tg-join-group-exam-bot/1.0" },
+    cf: { cacheTtl: 60 }, // 60s 边缘缓存, 抗洪峰
+  });
+  if (!res.ok) throw new Error(`RSS fetch HTTP ${res.status}`);
+  return parseRssTitle(await res.text());
+}
+
+// 取某题型当前正确答案: blog/youtube 固定常量; rss 实时抓 (失败抛错)
+async function computeAnswer(env, type) {
+  if (type === "blog") return BLOG_ANSWER;
+  if (type === "youtube") return YOUTUBE_ANSWER;
+  return await fetchLatestPostTitle(env);
 }
 
 // ---------------------------------------------------------------- 业务流程
@@ -143,7 +176,7 @@ async function handleJoin(env, newMember, chat) {
   });
   // 还有一个方案是设置 telegram group welcome message, 这样不会对其它群友造成影响
   // https://zelikk.blogspot.com/2026/09/telegram-group-welcome-message.html
-
+  
   log(`joined+muted user=${user.id} chat=${chat.id}`);
 }
 
@@ -172,8 +205,9 @@ async function handleStart(env, user) {
     await api(env, "sendMessage", { chat_id: user.id, text: INTRO_TEXT });
     return;
   }
-  await api(env, "sendMessage", { chat_id: user.id, text: QUESTION_TEXT });
-  log(`quiz served user=${user.id}`);
+  const type = questionType(user.id);
+  await api(env, "sendMessage", { chat_id: user.id, text: QUESTION_TEXT[type] });
+  log(`quiz served user=${user.id} type=${type}`);
 }
 
 // 私聊文本回答: 实时重算答案并比对
@@ -182,9 +216,10 @@ async function handleAnswer(env, user, text) {
   if (user.id < LEGACY_USER_ID_MAX) return; // 免验证用户不需要这套
   if (!(await isInGroup(env, env.CHAT_ID, user.id))) return; // 非成员: 忽略
 
+  const type = questionType(user.id);
   let correct;
   try {
-    correct = await fetchLatestPostTitle(env);
+    correct = await computeAnswer(env, type);
   } catch (e) {
     // RSS 暂时抓不到: 不出题不判分, 让用户稍后重试
     await api(env, "sendMessage", {
@@ -200,7 +235,7 @@ async function handleAnswer(env, user, text) {
     // 答案错误: 重发同一题面, 下一轮判分仍会实时重算 (旧答案即刻作废)
     await api(env, "sendMessage", {
       chat_id: user.id,
-      text: `❌ 答案错误，请重试！\n\n${QUESTION_TEXT}`,
+      text: `❌ 答案错误，请重试！\n\n${QUESTION_TEXT[type]}`,
     });
     log(`wrong answer user=${user.id}`);
     return;
@@ -385,3 +420,6 @@ export default {
 function log(line) {
   console.log(new Date().toISOString(), line);
 }
+
+// 导出纯函数仅供本地测试 (test.js); Worker 部署不受影响
+export { questionType, normalize, parseRssTitle };
