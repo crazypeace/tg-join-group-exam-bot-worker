@@ -114,8 +114,10 @@ function normalize(s) {
 }
 
 // 非常快的 32-bit 混合 (Knuth 黄金比例乘法 + xorshift), 仅整数运算, 无字符串/BigInt
-function questionType(userId) {
-  let x = Math.imul(userId | 0, 0x9e3779b1) >>> 0;
+// 种子 = userid ^ 天数 (unix ms 整除 86400000 的纯数字) — 同一天内题型稳定, 跨天可能变化
+function questionType(userId, now = Date.now()) {
+  const seed = (userId | 0) ^ Math.floor(now / 86400000);
+  let x = Math.imul(seed, 0x9e3779b1) >>> 0;
   x ^= x >>> 16;
   x = Math.imul(x, 0x21f0aaad) >>> 0;
   x = (x ^ (x >>> 15)) >>> 0; // 末尾必须再转 unsigned, 否则可能为负 -> %3 得负索引
